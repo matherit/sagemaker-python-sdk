@@ -16,6 +16,8 @@ from __future__ import absolute_import, print_function
 import json
 import logging
 import os
+import psutil
+import signal
 import subprocess
 import tempfile
 import uuid
@@ -1798,6 +1800,12 @@ class EstimatorBase(with_metaclass(ABCMeta, object)):  # pylint: disable=too-man
             self._tensorboard_temp_dir.cleanup()
         if isinstance(self._aws_sync_proc, subprocess.Popen):
             self._aws_sync_proc.terminate()
+            proc_id = self._tensorboard_proc.pid
+            # Hack to kill children processes... There is probably a better way to do this.
+            parent = psutil.Process(proc_id)
+            children = parent.children(recursive=True)
+            for process in children:
+                process.send_signal(signal.SIGTERM)
             self._tensorboard_proc.terminate()
 
     def __del__(self):
