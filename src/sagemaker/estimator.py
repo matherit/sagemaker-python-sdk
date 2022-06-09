@@ -16,6 +16,8 @@ from __future__ import absolute_import, print_function
 import json
 import logging
 import os
+import subprocess
+import tempfile
 import uuid
 from abc import ABCMeta, abstractmethod
 from typing import Any, Dict
@@ -529,6 +531,10 @@ class EstimatorBase(with_metaclass(ABCMeta, object)):  # pylint: disable=too-man
         self.profiler_rules = None
         self.debugger_rules = None
 
+        self._tensorboard_temp_dir = None
+        self._aws_sync_proc = None
+        self._tensorboard_proc = None
+
     @abstractmethod
     def training_image_uri(self):
         """Return the Docker image to use for training.
@@ -977,6 +983,11 @@ class EstimatorBase(with_metaclass(ABCMeta, object)):  # pylint: disable=too-man
 
         self.latest_training_job = _TrainingJob.start_new(self, inputs, experiment_config)
         self.jobs.append(self.latest_training_job)
+
+        # TODO: Dirty Tensorboard startup
+        if self.tensorboard_output_config:
+            self._start_tensorboard()
+
         if wait:
             self.latest_training_job.wait(logs=logs)
 
@@ -1774,6 +1785,23 @@ class EstimatorBase(with_metaclass(ABCMeta, object)):  # pylint: disable=too-man
         profiler_config_request_dict = self.profiler_config._to_request_dict()
 
         _TrainingJob.update(self, profiler_rule_configs, profiler_config_request_dict)
+
+    def _start_tensorboard(self):
+        """Starts a tensorboard process for the currently running training job."""
+        self._tensorboard_temp_dir = tempfile.TemporaryDirectory()
+        self._aws_sync_proc = subprocess.Popen(f'while  [ true ]; do aws s3 sync {self.tensorboard_output_config.s3_output_path} {self._tensorboard_temp_dir.name}; sleep 60; done', shell=True)
+        self._tensorboard_proc = subprocess.Popen(f'tensorboard --host 0.0.0.0 --port 6006 --logdir {self._tensorboard_temp_dir.name}', shell=True)
+        logger.info("TensorBoard started at: http://0.0.0.0:6006/")
+
+    def stop_tensorboard(self):
+        if isinstance(self._tensorboard_temp_dir, tempfile.TemporaryDirectory):
+            self._tensorboard_temp_dir.cleanup()
+        if isinstance(self._aws_sync_proc, subprocess.Popen):
+            self._aws_sync_proc.terminate()
+            self._tensorboard_proc.terminate()
+
+    def __del__(self):
+        self.stop_tensorboard()
 
 
 class _TrainingJob(_Job):
