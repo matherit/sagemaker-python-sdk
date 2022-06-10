@@ -20,6 +20,7 @@ import psutil
 import signal
 import subprocess
 import tempfile
+import time
 import uuid
 from abc import ABCMeta, abstractmethod
 from typing import Any, Dict
@@ -534,7 +535,7 @@ class EstimatorBase(with_metaclass(ABCMeta, object)):  # pylint: disable=too-man
         self.debugger_rules = None
 
         self._tensorboard_temp_dir = None
-        self._aws_sync_proc = None
+        self._aws_sync_proc = []
         self._tensorboard_proc = None
 
     @abstractmethod
@@ -1788,18 +1789,24 @@ class EstimatorBase(with_metaclass(ABCMeta, object)):  # pylint: disable=too-man
 
         _TrainingJob.update(self, profiler_rule_configs, profiler_config_request_dict)
 
+    def _aws_s3_sync(self, s3_output_path):
+        self._aws_sync_proc.append(subprocess.Popen(
+            f'while  [ true ]; do aws s3 sync {s3_output_path} {self._tensorboard_temp_dir.name}; sleep 60; done',
+            shell=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.STDOUT))
+
     def _start_tensorboard(self):
         """Starts a tensorboard process for the currently running training job."""
         self._tensorboard_temp_dir = tempfile.TemporaryDirectory()
-        self._aws_sync_proc = subprocess.Popen(f'while  [ true ]; do aws s3 sync {self.tensorboard_output_config.s3_output_path} {self._tensorboard_temp_dir.name}; sleep 60; done', shell=True)
-        self._tensorboard_proc = subprocess.Popen(f'tensorboard --host 0.0.0.0 --port 6006 --logdir {self._tensorboard_temp_dir.name}', shell=True)
+        self._aws_s3_sync(self.tensorboard_output_config.s3_output_path)
+        self._tensorboard_proc = subprocess.Popen(
+            f'tensorboard --host 0.0.0.0 --port 6006 --logdir {self._tensorboard_temp_dir.name}',
+            shell=True)
         logger.info("TensorBoard started at: http://0.0.0.0:6006/")
 
     def stop_tensorboard(self):
-        if isinstance(self._tensorboard_temp_dir, tempfile.TemporaryDirectory):
-            self._tensorboard_temp_dir.cleanup()
-        if isinstance(self._aws_sync_proc, subprocess.Popen):
-            self._aws_sync_proc.terminate()
+        if isinstance(self._tensorboard_proc, subprocess.Popen):
             proc_id = self._tensorboard_proc.pid
             # Hack to kill children processes... There is probably a better way to do this.
             parent = psutil.Process(proc_id)
@@ -1807,8 +1814,44 @@ class EstimatorBase(with_metaclass(ABCMeta, object)):  # pylint: disable=too-man
             for process in children:
                 process.send_signal(signal.SIGTERM)
             self._tensorboard_proc.terminate()
+            # Ensure this code only runs once
+            self._tensorboard_proc = None
+            for aws_sync_proc in self._aws_sync_proc:
+                aws_sync_proc.terminate()
+        if isinstance(self._tensorboard_temp_dir, tempfile.TemporaryDirectory):
+            try:
+                self._tensorboard_temp_dir.cleanup()
+            except OSError:
+                # Tempdir cleanup can fail if disk operations are still ocurring. Later versions of
+                # Python account for this with `ignore_cleanup_errors`:
+                # https://docs.python.org/3/library/tempfile.html#tempfile.TemporaryDirectory
+                # From testing, waiting a few seconds and trying again seems to work as a bandaid.
+                time.sleep(3)
+                self._tensorboard_temp_dir.cleanup()
+            # Ensure this code only runs once
+            self._tensorboard_temp_dir = None
+
+    def tensorboard_ingest_job(self, client, job_name):
+        response = client.describe_training_job(
+            TrainingJobName=job_name
+        )
+
+        s3_output_path = response['TensorBoardOutputConfig']['S3OutputPath']
+        # If no tensorboard is running, start it.
+        if self._tensorboard_proc is None:
+            self.tensorboard_output_config = TensorBoardOutputConfig(s3_output_path=s3_output_path)
+            self._start_tensorboard()
+        else:
+            # Begin pulling in the other job's s3 folders we want to include in TensorBoard.
+            self._aws_s3_sync(s3_output_path)
+            
+
 
     def __del__(self):
+        # This is having issues kill TB child processes if not cleaned up before exiting.
+        # TODO: Find more robust way to do this.
+        # Note: There doesn't appear to be an issue if stop_tensorboard is called outside of
+        # destructor.
         self.stop_tensorboard()
 
 
